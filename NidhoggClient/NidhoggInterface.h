@@ -8,7 +8,8 @@
 #include "RegistryHandler.h"
 #include "ThreadHandler.h"
 
-constexpr wchar_t NIDHOGG_DEVICE_NAME[] = L"\\\\.\\Nidhogg";
+// Win32 path for the driver's \??\XXXX symbolic link, which targets \Device\XXXX.
+constexpr wchar_t NIDHOGG_DEVICE_NAME[] = L"\\\\.\\XXXX";
 
 class NidhoggInterfaceException : public std::runtime_error {
 private:

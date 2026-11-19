@@ -99,3 +99,15 @@ PVOID GetSSDTFunctionAddress(_In_ const PSYSTEM_SERVICE_DESCRIPTOR_TABLE ssdt, _
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS ConvertAnsiToUnicode(_In_ PCHAR ansiString, _Out_ PUNICODE_STRING outString);
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS GetProcessCr3(_In_ ULONG pid, _Out_ PULONG64 cr3);
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS ReadPhysicalMemory(_In_ ULONG64 physicalAddress, _Out_writes_bytes_(size) PVOID buffer, _In_ SIZE_T size);
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS TranslateVirtualToPhysical(_In_ ULONG64 cr3, _In_ ULONG64 virtualAddress, _Out_ PULONG64 physicalAddress, _Out_opt_ PSIZE_T pageSize);
+
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS ReadVirtualMemoryByCr3(_In_ ULONG64 cr3, _In_ ULONG64 virtualAddress, _Out_writes_bytes_(size) PVOID buffer, _In_ SIZE_T size);

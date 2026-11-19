@@ -1,6 +1,6 @@
 #include "pch.h"
 #include "IrpHandlers.h"
-
+#define SAFEMODE 1
 /*
 * Description:
 * NidhoggDeviceControl is responsible for handling IOCTLs and returning output to the user via IRPs.
@@ -27,6 +27,7 @@ NTSTATUS NidhoggDeviceControl(_Inout_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP 
 	ULONG outputSize = stack->Parameters.DeviceIoControl.OutputBufferLength;
 
 	switch (stack->Parameters.DeviceIoControl.IoControlCode) {
+#if !SAFEMODE
 	case IOCTL_PROTECT_UNPROTECT_PROCESS:
 	{
 		if (!Features.ProcessProtection) {
@@ -1290,6 +1291,159 @@ NTSTATUS NidhoggDeviceControl(_Inout_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP 
 			status = STATUS_UNSUCCESSFUL;
 			break;
 		}
+		break;
+	}
+#endif
+	case IOCTL_SUSPEND_PROCESS:
+	{
+		if (inputSize != sizeof(ULONG)) {
+			status = STATUS_INVALID_BUFFER_SIZE;
+			break;
+		}
+		auto data = static_cast<ULONG*>(Irp->AssociatedIrp.SystemBuffer);
+
+		if (!IsValidPid(*data)) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		status = NidhoggProcessHandler->SuspendProcess(*data);
+
+		if (!NT_SUCCESS(status)) {
+			NidhoggLogger.Error(DRIVER_PREFIX "Failed to suspend process with pid %d: (0x%08X).\n", *data, status);
+			break;
+		}
+
+		NidhoggLogger.Info(DRIVER_PREFIX "Suspended process with pid %d.\n", *data);
+		len += inputSize;
+		break;
+	}
+	case IOCTL_DUMP_PROCESS:
+	{
+		if (inputSize != sizeof(IoctlProcessDump)) {
+			status = STATUS_INVALID_BUFFER_SIZE;
+			break;
+		}
+		auto data = static_cast<IoctlProcessDump*>(Irp->AssociatedIrp.SystemBuffer);
+
+		if (!IsValidPid(data->Pid) ||
+			wcsnlen(data->DumpPath, MAX_PATH_COPY) == MAX_PATH_COPY) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		NidhoggLogger.Info(DRIVER_PREFIX "Dumping process %d to %ws.\n", data->Pid, data->DumpPath);
+		status = NidhoggProcessHandler->DumpProcess(*data);
+
+		if (!NT_SUCCESS(status)) {
+			NidhoggLogger.Error(DRIVER_PREFIX "Failed to dump process %d: (0x%08X).\n", data->Pid, status);
+			break;
+		}
+
+		NidhoggLogger.Info(DRIVER_PREFIX "Dumped process %d successfully.\n", data->Pid);
+		break;
+	}
+	case IOCTL_GET_PROCESS_CR3:
+	{
+		if (inputSize != sizeof(IoctlProcessCr3) || outputSize != sizeof(IoctlProcessCr3)) {
+			status = STATUS_INVALID_BUFFER_SIZE;
+			break;
+		}
+		auto data = static_cast<IoctlProcessCr3*>(Irp->AssociatedIrp.SystemBuffer);
+
+		if (!data->Pid) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		status = GetProcessCr3(data->Pid, reinterpret_cast<PULONG64>(&data->Cr3));
+
+		if (!NT_SUCCESS(status)) {
+			NidhoggLogger.Error(DRIVER_PREFIX "Failed to get CR3 for pid %d: (0x%08X)\n", data->Pid, status);
+			break;
+		}
+
+		len += outputSize;
+		break;
+	}
+	case IOCTL_READ_QWORD_BY_CR3:
+	{
+		if (!Features.ReadData) {
+			NidhoggLogger.Warning(DRIVER_PREFIX "Due to previous error, read data feature is unavaliable.\n");
+			status = STATUS_UNSUCCESSFUL;
+			break;
+		}
+		if (inputSize != sizeof(IoctlCr3ReadQword) || outputSize != sizeof(IoctlCr3ReadQword)) {
+			status = STATUS_INVALID_BUFFER_SIZE;
+			break;
+		}
+		auto data = static_cast<IoctlCr3ReadQword*>(Irp->AssociatedIrp.SystemBuffer);
+
+		if (!data->Cr3 || !data->Address) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		status = ReadVirtualMemoryByCr3(data->Cr3, data->Address, &data->Value, sizeof(data->Value));
+
+		if (!NT_SUCCESS(status)) {
+			NidhoggLogger.Error(DRIVER_PREFIX "Failed to read qword at 0x%llx via CR3 0x%llx: (0x%08X)\n",
+				data->Address, data->Cr3, status);
+			break;
+		}
+
+		len += outputSize;
+		break;
+	}
+	case IOCTL_READ_MEMORY_BY_CR3:
+	{
+		if (!Features.ReadData) {
+			NidhoggLogger.Warning(DRIVER_PREFIX "Due to previous error, read data feature is unavaliable.\n");
+			status = STATUS_UNSUCCESSFUL;
+			break;
+		}
+		if (inputSize != sizeof(IoctlCr3ReadMemory)) {
+			status = STATUS_INVALID_BUFFER_SIZE;
+			break;
+		}
+		auto data = static_cast<IoctlCr3ReadMemory*>(Irp->AssociatedIrp.SystemBuffer);
+
+		if (!data->Cr3 || !data->Address || !data->Buffer || data->Size == 0 || data->Size > MAX_CR3_READ_SIZE) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		status = ProbeAddress(data->Buffer, data->Size, 1);
+
+		if (!NT_SUCCESS(status))
+			break;
+
+		MemoryAllocator<PUCHAR> kernelBuffer(data->Size);
+
+		if (!kernelBuffer.IsValid()) {
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
+		}
+
+		status = ReadVirtualMemoryByCr3(data->Cr3, data->Address, kernelBuffer.Get(), data->Size);
+
+		if (!NT_SUCCESS(status)) {
+			NidhoggLogger.Error(DRIVER_PREFIX "Failed to read 0x%llx bytes at 0x%llx via CR3 0x%llx: (0x%08X)\n",
+				data->Size, data->Address, data->Cr3, status);
+			break;
+		}
+
+		SIZE_T bytesWritten = 0;
+		status = MmCopyVirtualMemory(PsGetCurrentProcess(), kernelBuffer.Get(), PsGetCurrentProcess(), data->Buffer,
+			data->Size, KernelMode, &bytesWritten);
+
+		if (!NT_SUCCESS(status) || bytesWritten != data->Size) {
+			NidhoggLogger.Error(DRIVER_PREFIX "Failed to copy CR3 read result to user buffer: (0x%08X)\n", status);
+			status = NT_SUCCESS(status) ? STATUS_PARTIAL_COPY : status;
+			break;
+		}
+
+		len += inputSize;
 		break;
 	}
 	default:

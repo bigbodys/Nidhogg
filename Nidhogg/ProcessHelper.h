@@ -8,6 +8,7 @@ constexpr SIZE_T PROCESS_TERMINATE = 0x1;
 constexpr SIZE_T PROCESS_CREATE_THREAD = 0x2;
 constexpr SIZE_T PROCESS_VM_READ = 0x10;
 constexpr SIZE_T PROCESS_VM_OPERATION = 0x8;
+constexpr SIZE_T PROCESS_QUERY_INFORMATION = 0x400;
 
 _IRQL_requires_max_(APC_LEVEL)
 ULONG FindPidByName(_In_ const wchar_t* processName);

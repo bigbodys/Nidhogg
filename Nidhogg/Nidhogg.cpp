@@ -1,14 +1,22 @@
 #include "pch.h"
 #include "Nidhogg.h"
 
-extern "C"
-_Function_class_(DRIVER_INITIALIZE)
+#ifdef DRIVER_REFLECTIVELY_LOADED
+/*
+* Description:
+* ReflectiveLoadThread is responsible for creating the driver object when the driver is reflectively loaded.
+*
+* Parameters:
+* @StartContext [PVOID] -- Unused.
+*
+* Returns:
+* There is no return value.
+*/
+_Function_class_(KSTART_ROUTINE)
 _IRQL_requires_same_
 _IRQL_requires_(PASSIVE_LEVEL)
-NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
-#ifdef DRIVER_REFLECTIVELY_LOADED
-	UNREFERENCED_PARAMETER(DriverObject);
-	UNREFERENCED_PARAMETER(RegistryPath);
+void ReflectiveLoadThread(PVOID StartContext) {
+	UNREFERENCED_PARAMETER(StartContext);
 	Features.DriverReflectivelyLoaded = true;
 	Features.ProcessProtection = false;
 	Features.ThreadProtection = false;
@@ -20,14 +28,40 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 	UNICODE_STRING routineName = RTL_CONSTANT_STRING(L"IoCreateDriver");
 	tIoCreateDriver IoCreateDriver = (tIoCreateDriver)MmGetSystemRoutineAddress(&routineName);
 
-	if (!IoCreateDriver)
-		return STATUS_INCOMPATIBLE_DRIVER_BLOCKED;
+	if (!IoCreateDriver) {
+		PsTerminateSystemThread(STATUS_INCOMPATIBLE_DRIVER_BLOCKED);
+		return;
+	}
 
 	NTSTATUS status = IoCreateDriver(&driverName, &NidhoggEntry);
 
 	if (!NT_SUCCESS(status))
 		NidhoggLogger.Error(DRIVER_PREFIX "Failed to create driver: (0x%08X)\n", status);
-	return status;
+
+	PsTerminateSystemThread(status);
+}
+#endif
+
+extern "C"
+_Function_class_(DRIVER_INITIALIZE)
+_IRQL_requires_same_
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+#ifdef DRIVER_REFLECTIVELY_LOADED
+	UNREFERENCED_PARAMETER(DriverObject);
+	UNREFERENCED_PARAMETER(RegistryPath);
+
+	HANDLE threadHandle = nullptr;
+	NTSTATUS status = PsCreateSystemThread(&threadHandle, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr,
+		ReflectiveLoadThread, nullptr);
+
+	if (!NT_SUCCESS(status)) {
+		NidhoggLogger.Error(DRIVER_PREFIX "Failed to create reflective load thread: (0x%08X)\n", status);
+		return status;
+	}
+
+	ZwClose(threadHandle);
+	return STATUS_SUCCESS;
 #endif
 
 	return NidhoggEntry(DriverObject, RegistryPath);

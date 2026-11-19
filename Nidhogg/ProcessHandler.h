@@ -85,6 +85,12 @@ public:
 	NTSTATUS ElevateProcess(_In_ ULONG pid);
 
 	_IRQL_requires_max_(APC_LEVEL)
+	NTSTATUS SuspendProcess(_In_ ULONG pid);
+
+	_IRQL_requires_(PASSIVE_LEVEL)
+	NTSTATUS DumpProcess(_In_ const IoctlProcessDump& dumpRequest);
+
+	_IRQL_requires_max_(APC_LEVEL)
 	NTSTATUS SetProcessSignature(_In_ IoctlProcessSignature* processSignature);
 
 	_IRQL_requires_max_(APC_LEVEL)

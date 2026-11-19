@@ -587,3 +587,230 @@ NTSTATUS ConvertAnsiToUnicode(_In_ PCHAR ansiString, _Out_ PUNICODE_STRING outSt
 	RtlInitAnsiString(&aFunctionName, ansiString);
 	return RtlAnsiStringToUnicodeString(outString, &aFunctionName, TRUE);;
 }
+
+constexpr ULONG KPROCESS_DIRECTORY_TABLE_BASE_OFFSET = 0x28;
+constexpr ULONG64 PTE_PRESENT_FLAG = 0x1;
+constexpr ULONG64 PTE_LARGE_PAGE_FLAG = 0x80;
+constexpr ULONG64 PTE_PFN_MASK = 0x000FFFFFFFFFF000ULL;
+constexpr ULONG64 PDE_1GB_PFN_MASK = 0x000FFFFFC0000000ULL;
+constexpr ULONG64 PDE_2MB_PFN_MASK = 0x000FFFFFFFE00000ULL;
+constexpr SIZE_T PAGE_SIZE_4KB = 0x1000;
+constexpr SIZE_T PAGE_SIZE_2MB = 0x200000;
+constexpr SIZE_T PAGE_SIZE_1GB = 0x40000000;
+
+/*
+* Description:
+* GetUserDirectoryTableBaseOffset is responsible for returning the KPROCESS.UserDirectoryTableBase
+* offset for the current Windows build.
+*
+* Parameters:
+* There are no parameters.
+*
+* Returns:
+* @offset [ULONG] -- Offset from KPROCESS, or 0 if the field does not exist.
+*/
+_IRQL_requires_max_(APC_LEVEL)
+ULONG GetUserDirectoryTableBaseOffset() {
+	if (WindowsBuildNumber >= WIN_2004)
+		return 0x388;
+
+	if (WindowsBuildNumber >= WIN_1903)
+		return 0x280;
+
+	if (WindowsBuildNumber >= WIN_1803)
+		return 0x278;
+
+	return 0;
+}
+
+/*
+* Description:
+* GetProcessCr3 is responsible for resolving a process CR3 from a PID.
+* When KVA shadow is enabled, UserDirectoryTableBase is preferred.
+*
+* Parameters:
+* @pid [_In_ ULONG]	   -- Target process id.
+* @cr3 [_Out_ PULONG64] -- Receives the process CR3.
+*
+* Returns:
+* @status [NTSTATUS] -- Whether the CR3 was resolved successfully or not.
+*/
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS GetProcessCr3(_In_ ULONG pid, _Out_ PULONG64 cr3) {
+	if (!pid || !cr3)
+		return STATUS_INVALID_PARAMETER;
+
+	*cr3 = 0;
+	PEPROCESS process = nullptr;
+	NTSTATUS status = PsLookupProcessByProcessId(ULongToHandle(pid), &process);
+
+	if (!NT_SUCCESS(status))
+		return status;
+
+	ULONG64 directoryTableBase = *reinterpret_cast<PULONG64>(
+		reinterpret_cast<PUCHAR>(process) + KPROCESS_DIRECTORY_TABLE_BASE_OFFSET);
+	ULONG userDirectoryTableBaseOffset = GetUserDirectoryTableBaseOffset();
+	ULONG64 resolvedCr3 = directoryTableBase;
+
+	if (userDirectoryTableBaseOffset) {
+		ULONG64 userDirectoryTableBase = *reinterpret_cast<PULONG64>(
+			reinterpret_cast<PUCHAR>(process) + userDirectoryTableBaseOffset);
+
+		if ((userDirectoryTableBase & PTE_PFN_MASK) != 0)
+			resolvedCr3 = userDirectoryTableBase;
+	}
+
+	ObDereferenceObject(process);
+
+	if ((resolvedCr3 & PTE_PFN_MASK) == 0)
+		return STATUS_NOT_FOUND;
+
+	*cr3 = resolvedCr3;
+	return STATUS_SUCCESS;
+}
+
+/*
+* Description:
+* ReadPhysicalMemory is responsible for reading physical memory into a kernel buffer.
+*
+* Parameters:
+* @physicalAddress [_In_ ULONG64] -- Physical address to read.
+* @buffer		   [_Out_ PVOID]  -- Destination buffer.
+* @size			   [_In_ SIZE_T]  -- Number of bytes to read.
+*
+* Returns:
+* @status [NTSTATUS] -- Whether the read succeeded or not.
+*/
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS ReadPhysicalMemory(_In_ ULONG64 physicalAddress, _Out_writes_bytes_(size) PVOID buffer, _In_ SIZE_T size) {
+	if (!buffer || size == 0)
+		return STATUS_INVALID_PARAMETER;
+
+	MM_COPY_ADDRESS source{};
+	source.PhysicalAddress.QuadPart = static_cast<LONGLONG>(physicalAddress);
+	SIZE_T bytesRead = 0;
+	NTSTATUS status = MmCopyMemory(buffer, source, size, MM_COPY_MEMORY_PHYSICAL, &bytesRead);
+
+	if (!NT_SUCCESS(status))
+		return status;
+
+	return bytesRead == size ? STATUS_SUCCESS : STATUS_PARTIAL_COPY;
+}
+
+/*
+* Description:
+* TranslateVirtualToPhysical is responsible for walking a process page table using CR3
+* and translating a virtual address to a physical address.
+*
+* Parameters:
+* @cr3			   [_In_ ULONG64]	  -- Process CR3 / directory table base.
+* @virtualAddress  [_In_ ULONG64]	  -- Virtual address to translate.
+* @physicalAddress [_Out_ PULONG64]	  -- Receives the translated physical address.
+* @pageSize		   [_Out_opt_ PSIZE_T] -- Receives the leaf page size if provided.
+*
+* Returns:
+* @status [NTSTATUS] -- Whether the translation succeeded or not.
+*/
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS TranslateVirtualToPhysical(_In_ ULONG64 cr3, _In_ ULONG64 virtualAddress, _Out_ PULONG64 physicalAddress,
+	_Out_opt_ PSIZE_T pageSize) {
+	if (!physicalAddress || (cr3 & PTE_PFN_MASK) == 0)
+		return STATUS_INVALID_PARAMETER;
+
+	*physicalAddress = 0;
+
+	if (pageSize)
+		*pageSize = 0;
+
+	ULONG64 entry = 0;
+	NTSTATUS status = ReadPhysicalMemory((cr3 & PTE_PFN_MASK) + ((virtualAddress >> 39) & 0x1FF) * sizeof(ULONG64),
+		&entry, sizeof(entry));
+
+	if (!NT_SUCCESS(status) || (entry & PTE_PRESENT_FLAG) == 0)
+		return NT_SUCCESS(status) ? STATUS_INVALID_ADDRESS : status;
+
+	status = ReadPhysicalMemory((entry & PTE_PFN_MASK) + ((virtualAddress >> 30) & 0x1FF) * sizeof(ULONG64),
+		&entry, sizeof(entry));
+
+	if (!NT_SUCCESS(status) || (entry & PTE_PRESENT_FLAG) == 0)
+		return NT_SUCCESS(status) ? STATUS_INVALID_ADDRESS : status;
+
+	if (entry & PTE_LARGE_PAGE_FLAG) {
+		*physicalAddress = (entry & PDE_1GB_PFN_MASK) | (virtualAddress & (PAGE_SIZE_1GB - 1));
+
+		if (pageSize)
+			*pageSize = PAGE_SIZE_1GB;
+		return STATUS_SUCCESS;
+	}
+
+	status = ReadPhysicalMemory((entry & PTE_PFN_MASK) + ((virtualAddress >> 21) & 0x1FF) * sizeof(ULONG64),
+		&entry, sizeof(entry));
+
+	if (!NT_SUCCESS(status) || (entry & PTE_PRESENT_FLAG) == 0)
+		return NT_SUCCESS(status) ? STATUS_INVALID_ADDRESS : status;
+
+	if (entry & PTE_LARGE_PAGE_FLAG) {
+		*physicalAddress = (entry & PDE_2MB_PFN_MASK) | (virtualAddress & (PAGE_SIZE_2MB - 1));
+
+		if (pageSize)
+			*pageSize = PAGE_SIZE_2MB;
+		return STATUS_SUCCESS;
+	}
+
+	status = ReadPhysicalMemory((entry & PTE_PFN_MASK) + ((virtualAddress >> 12) & 0x1FF) * sizeof(ULONG64),
+		&entry, sizeof(entry));
+
+	if (!NT_SUCCESS(status) || (entry & PTE_PRESENT_FLAG) == 0)
+		return NT_SUCCESS(status) ? STATUS_INVALID_ADDRESS : status;
+
+	*physicalAddress = (entry & PTE_PFN_MASK) | (virtualAddress & (PAGE_SIZE_4KB - 1));
+
+	if (pageSize)
+		*pageSize = PAGE_SIZE_4KB;
+	return STATUS_SUCCESS;
+}
+
+/*
+* Description:
+* ReadVirtualMemoryByCr3 is responsible for reading virtual memory by translating it through
+* the provided process CR3 and reading the backing physical pages.
+*
+* Parameters:
+* @cr3			  [_In_ ULONG64] -- Process CR3 / directory table base.
+* @virtualAddress [_In_ ULONG64] -- Virtual address to read.
+* @buffer		  [_Out_ PVOID]  -- Destination buffer.
+* @size			  [_In_ SIZE_T]  -- Number of bytes to read.
+*
+* Returns:
+* @status [NTSTATUS] -- Whether the read succeeded or not.
+*/
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS ReadVirtualMemoryByCr3(_In_ ULONG64 cr3, _In_ ULONG64 virtualAddress, _Out_writes_bytes_(size) PVOID buffer,
+	_In_ SIZE_T size) {
+	if (!buffer || size == 0 || (cr3 & PTE_PFN_MASK) == 0)
+		return STATUS_INVALID_PARAMETER;
+
+	auto dest = static_cast<PUCHAR>(buffer);
+
+	while (size) {
+		ULONG64 physicalAddress = 0;
+		SIZE_T mappedPageSize = 0;
+		NTSTATUS status = TranslateVirtualToPhysical(cr3, virtualAddress, &physicalAddress, &mappedPageSize);
+
+		if (!NT_SUCCESS(status) || mappedPageSize == 0)
+			return NT_SUCCESS(status) ? STATUS_INVALID_ADDRESS : status;
+
+		SIZE_T remainingInPage = mappedPageSize - (virtualAddress & (mappedPageSize - 1));
+		SIZE_T toRead = size < remainingInPage ? size : remainingInPage;
+		status = ReadPhysicalMemory(physicalAddress, dest, toRead);
+
+		if (!NT_SUCCESS(status))
+			return status;
+
+		virtualAddress += toRead;
+		dest += toRead;
+		size -= toRead;
+	}
+
+	return STATUS_SUCCESS;
+}

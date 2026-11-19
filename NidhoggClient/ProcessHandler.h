@@ -19,6 +19,8 @@ private:
 	bool Protect(_In_ DWORD pid, _In_ bool protect);
 	bool Hide(_In_ DWORD pid, _In_ bool hide);
 	bool Elevate(_In_ DWORD pid);
+	bool Suspend(_In_ DWORD pid);
+	bool Dump(_In_ DWORD pid, _In_ const std::filesystem::path& dumpPath);
 	bool SetProtection(_In_ DWORD pid, _In_ UCHAR signerType, _In_ UCHAR signatureSigner);
 	std::vector<DWORD> ListProcesses(_In_ ProcessType type);
 	bool ClearProcesses(_In_ ProcessType type);
@@ -37,6 +39,8 @@ public:
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "[hide] [pid] - Hide a process" << std::endl;
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "[unhide | restore] [pid] - Revealing a process after hiding it" << std::endl;
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "elevate [pid] - Elevating a process to system" << std::endl;
+		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "suspend [pid] - Suspending a process" << std::endl;
+		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "dump [pid] [optional output path] - Creating a full process memory dump" << std::endl;
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "list [hidden | protected] - Listing the currently hidden or protected processes" << std::endl;
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "set_protection [signer type] [signature signer] - Changing the signature level of a process (PP/PPL)" << std::endl;
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "clear [all | hidden | protected] - Clear all hidden or protected processes" << std::endl;

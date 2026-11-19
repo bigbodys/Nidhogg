@@ -1,8 +1,8 @@
 #pragma once
 #include "pch.h"
 
-#define LOGGING_PREFIX "[Nidhogg :: "
-constexpr CHAR NO_PREFIX_LOGGING[] = "[Nidhogg]: ";
+#define LOGGING_PREFIX "[XXXX :: "
+constexpr CHAR NO_PREFIX_LOGGING[] = "[XXXX]: ";
 constexpr ULONG64 LOG_LEVELS_COUNT = 4;
 constexpr SIZE_T MAX_LOG_LEVEL_PREFIX_LEN = 12;
 
@@ -22,13 +22,6 @@ private:
 		"Info",
 		"Warning",
 		"Error"
-	};
-
-	static constexpr UCHAR TraceLevels[LOG_LEVELS_COUNT] = {
-		DPFLTR_TRACE_LEVEL,
-		DPFLTR_INFO_LEVEL,
-		DPFLTR_WARNING_LEVEL,
-		DPFLTR_ERROR_LEVEL
 	};
 
 public:

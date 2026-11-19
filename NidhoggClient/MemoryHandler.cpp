@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <iomanip>
 #include "MemoryHandler.h"
 
 /*
@@ -318,6 +319,61 @@ void MemoryHandler::HandleCommand(_In_ std::string command) {
 			return;
 		}
 		std::wcout << L"NOF " << nofPath << L" loaded successfully." << std::endl;
+	}
+	else if (commandName.compare("get_cr3") == 0) {
+		if (params.size() != 1 || !IsValidPid(params.at(0))) {
+			PrintHelp();
+			return;
+		}
+
+		DWORD pid = static_cast<DWORD>(atoi(params.at(0).c_str()));
+
+		try {
+			unsigned long long cr3 = GetProcessCr3(pid);
+			std::cout << "CR3 of process " << pid << ": 0x" << std::hex << cr3 << std::dec << std::endl;
+		}
+		catch (const MemoryHandlerException& e) {
+			std::cerr << "Failed to get CR3: " << e.what() << std::endl;
+		}
+	}
+	else if (commandName.compare("read_cr3_qword") == 0) {
+		if (params.size() != 2) {
+			PrintHelp();
+			return;
+		}
+
+		try {
+			unsigned long long cr3 = ConvertToNumber<std::string, unsigned long long>(params.at(0));
+			unsigned long long address = ConvertToNumber<std::string, unsigned long long>(params.at(1));
+			unsigned long long value = ReadQwordByCr3(cr3, address);
+			std::cout << "0x" << std::hex << address << ": 0x" << value << std::dec << std::endl;
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Failed to read qword: " << e.what() << std::endl;
+		}
+	}
+	else if (commandName.compare("read_cr3") == 0) {
+		if (params.size() != 3) {
+			PrintHelp();
+			return;
+		}
+
+		try {
+			unsigned long long cr3 = ConvertToNumber<std::string, unsigned long long>(params.at(0));
+			unsigned long long address = ConvertToNumber<std::string, unsigned long long>(params.at(1));
+			SIZE_T size = ConvertToNumber<std::string, SIZE_T>(params.at(2));
+			std::vector<byte> data = ReadMemoryByCr3(cr3, address, size);
+
+			for (SIZE_T i = 0; i < data.size(); i++) {
+				if (i % 16 == 0)
+					std::cout << std::endl << "0x" << std::hex << (address + i) << ": ";
+				std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[i]) << " ";
+			}
+			std::cout << std::dec << std::endl;
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Failed to read memory: " << e.what() << std::endl;
+		}
 	}
 	else {
 		std::cerr << "Invalid command!" << std::endl;
@@ -753,4 +809,84 @@ bool MemoryHandler::LoadNof(_In_ std::vector<byte> data,
 		0, 
 		&returned,
 		nullptr);
+}
+
+/*
+ * Description:
+ * GetProcessCr3 is responsible for issuing IOCTL_GET_PROCESS_CR3 to resolve a process CR3.
+ *
+ * Parameters:
+ * @pid [_In_ DWORD] -- Target process id.
+ *
+ * Returns:
+ * @unsigned long long -- Process CR3 on success.
+ */
+unsigned long long MemoryHandler::GetProcessCr3(_In_ DWORD pid) {
+	DWORD returned = 0;
+	IoctlProcessCr3 request{};
+	request.Pid = pid;
+
+	if (!DeviceIoControl(*hNidhogg.get(), IOCTL_GET_PROCESS_CR3, &request, sizeof(request),
+		&request, sizeof(request), &returned, nullptr)) {
+		throw MemoryHandlerException("Failed to get process CR3 " + std::to_string(GetLastError()));
+	}
+
+	return request.Cr3;
+}
+
+/*
+ * Description:
+ * ReadQwordByCr3 is responsible for issuing IOCTL_READ_QWORD_BY_CR3 to read 8 bytes.
+ *
+ * Parameters:
+ * @cr3	    [_In_ unsigned long long] -- Process CR3.
+ * @address [_In_ unsigned long long] -- Virtual address to read.
+ *
+ * Returns:
+ * @unsigned long long -- The 8 bytes that were read.
+ */
+unsigned long long MemoryHandler::ReadQwordByCr3(_In_ unsigned long long cr3, _In_ unsigned long long address) {
+	DWORD returned = 0;
+	IoctlCr3ReadQword request{};
+	request.Cr3 = cr3;
+	request.Address = address;
+
+	if (!DeviceIoControl(*hNidhogg.get(), IOCTL_READ_QWORD_BY_CR3, &request, sizeof(request),
+		&request, sizeof(request), &returned, nullptr)) {
+		throw MemoryHandlerException("Failed to read qword by CR3 " + std::to_string(GetLastError()));
+	}
+
+	return request.Value;
+}
+
+/*
+ * Description:
+ * ReadMemoryByCr3 is responsible for issuing IOCTL_READ_MEMORY_BY_CR3 to read a buffer.
+ *
+ * Parameters:
+ * @cr3	    [_In_ unsigned long long] -- Process CR3.
+ * @address [_In_ unsigned long long] -- Virtual address to read.
+ * @size    [_In_ SIZE_T]			 -- Number of bytes to read.
+ *
+ * Returns:
+ * @std::vector<byte> -- The bytes that were read.
+ */
+std::vector<byte> MemoryHandler::ReadMemoryByCr3(_In_ unsigned long long cr3, _In_ unsigned long long address, _In_ SIZE_T size) {
+	if (size == 0 || size > MAX_CR3_READ_SIZE)
+		throw MemoryHandlerException("Invalid read size");
+
+	DWORD returned = 0;
+	std::vector<byte> buffer(size);
+	IoctlCr3ReadMemory request{};
+	request.Cr3 = cr3;
+	request.Address = address;
+	request.Size = size;
+	request.Buffer = buffer.data();
+
+	if (!DeviceIoControl(*hNidhogg.get(), IOCTL_READ_MEMORY_BY_CR3, &request, sizeof(request),
+		nullptr, 0, &returned, nullptr)) {
+		throw MemoryHandlerException("Failed to read memory by CR3 " + std::to_string(GetLastError()));
+	}
+
+	return buffer;
 }

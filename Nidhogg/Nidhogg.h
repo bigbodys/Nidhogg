@@ -16,9 +16,9 @@ extern "C" {
 
 // Definitions.
 constexpr SIZE_T REGISTERED_OB_CALLBACKS = 2;
-constexpr wchar_t DRIVER_NAME[] = L"\\Driver\\Nidhogg";
-constexpr wchar_t DRIVER_DEVICE_NAME[] = L"\\Device\\Nidhogg";
-constexpr wchar_t DRIVER_SYMBOLIC_LINK[] = L"\\??\\Nidhogg";
+constexpr wchar_t DRIVER_NAME[] = L"\\Driver\\XXXX";
+constexpr wchar_t DRIVER_DEVICE_NAME[] = L"\\Device\\XXXX";
+constexpr wchar_t DRIVER_SYMBOLIC_LINK[] = L"\\??\\XXXX";
 constexpr wchar_t OB_CALLBACKS_ALTITUDE[] = L"31105.6171";
 constexpr wchar_t REG_CALLBACK_ALTITUDE[] = L"31122.6172";
 

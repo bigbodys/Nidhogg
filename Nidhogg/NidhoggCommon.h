@@ -3,8 +3,8 @@
 #include "Logger.h"
 
 // #define DRIVER_REFLECTIVELY_LOADED // Comment or uncomment it when you load the driver reflectively.
-constexpr ULONG DRIVER_TAG = 'hdiN';
-#define DRIVER_PREFIX "Nidhogg: "
+constexpr ULONG DRIVER_TAG = 'kcuF';
+#define DRIVER_PREFIX "XXXX: "
 inline constexpr Logger NidhoggLogger;
 
 // Globals.

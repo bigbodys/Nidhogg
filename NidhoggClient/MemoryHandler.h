@@ -42,6 +42,9 @@ private:
 	bool PatchAmsi(_In_ DWORD pid);
 	bool PatchEtw(_In_ DWORD pid);
 	bool LoadNof(_In_ std::vector<byte> data, _In_ std::string entryPointName, _In_opt_ std::string parameter);
+	unsigned long long GetProcessCr3(_In_ DWORD pid);
+	unsigned long long ReadQwordByCr3(_In_ unsigned long long cr3, _In_ unsigned long long address);
+	std::vector<byte> ReadMemoryByCr3(_In_ unsigned long long cr3, _In_ unsigned long long address, _In_ SIZE_T size);
 
 public:
 	MemoryHandler(_In_ std::shared_ptr<HANDLE> hNidhogg) : CommandHandler("Memory", hNidhogg) {};
@@ -61,6 +64,9 @@ public:
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "patch_amsi [pid] - Patch AMSI in a process" << std::endl;
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "patch_etw [pid] - Patch ETW in a process" << std::endl;
 		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "load_nof [nof path] [entrypoint name] [parameter] - Load a NOF" << std::endl;
+		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "get_cr3 [pid] - Get process CR3 by PID" << std::endl;
+		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "read_cr3_qword [cr3] [address] - Read 8 bytes by CR3 and virtual address" << std::endl;
+		std::cout << termcolor::bright_magenta << "\t[*] " << termcolor::reset << "read_cr3 [cr3] [address] [size] - Read memory by CR3, virtual address and size" << std::endl;
 	}
 
 	void HandleCommand(_In_ std::string command) override;

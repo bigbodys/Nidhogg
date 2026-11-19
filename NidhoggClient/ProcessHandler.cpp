@@ -194,6 +194,38 @@ void ProcessHandler::HandleCommand(_In_ std::string command) {
 		Elevate(pid) ? std::cout << "Process " << pid << " elevated" << std::endl :
 			std::cerr << "Failed to elevate process " << pid << std::endl;
 	}
+	else if (commandName.compare("suspend") == 0) {
+		if (!CheckInput(params)) {
+			PrintHelp();
+			return;
+		}
+		DWORD pid = static_cast<DWORD>(atoi(params.at(0).c_str()));
+
+		if (Suspend(pid))
+			std::cout << "Process " << pid << " suspended" << std::endl;
+		else {
+			DWORD error = GetLastError();
+			std::cerr << "Failed to suspend process " << pid << ": " << error << std::endl;
+		}
+	}
+	else if (commandName.compare("dump") == 0) {
+		if ((params.size() != 1 && params.size() != 2) || !IsValidPid(params.at(0))) {
+			std::cerr << "Invalid usage" << std::endl;
+			PrintHelp();
+			return;
+		}
+		DWORD pid = static_cast<DWORD>(atoi(params.at(0).c_str()));
+		std::filesystem::path dumpPath = params.size() == 2
+			? std::filesystem::path(params.at(1))
+			: std::filesystem::path("process_" + std::to_string(pid) + ".dmp");
+
+		if (Dump(pid, dumpPath))
+			std::cout << "Process " << pid << " dumped to " << dumpPath.string() << std::endl;
+		else {
+			DWORD error = GetLastError();
+			std::cerr << "Failed to dump process " << pid << ": " << error << std::endl;
+		}
+	}
 	else if (commandName.compare("list") == 0) {
 		if (params.size() != 1) {
 			std::cerr << "Invalid usage" << std::endl;
@@ -375,6 +407,88 @@ bool ProcessHandler::Hide(_In_ DWORD pid, _In_ bool hide) {
 bool ProcessHandler::Elevate(_In_ DWORD pid) {
 	DWORD returned;
 	return DeviceIoControl(*hNidhogg.get(), IOCTL_ELEVATE_PROCESS, &pid, sizeof(pid), nullptr, 0, &returned, nullptr);
+}
+
+/*
+* Description:
+* Suspend is responsible for suspending a process by its process id.
+*
+* Parameters:
+* @pid [_In_ DWORD] -- The process id to be suspended.
+*
+* Returns:
+* @bool             -- Whether the operation was successful or not.
+*/
+bool ProcessHandler::Suspend(_In_ DWORD pid) {
+	DWORD returned = 0;
+	return DeviceIoControl(*hNidhogg.get(), IOCTL_SUSPEND_PROCESS, &pid, sizeof(pid),
+		nullptr, 0, &returned, nullptr);
+}
+
+/*
+* Description:
+* Dump is responsible for creating a full memory dump for a process.
+*
+* Parameters:
+* @pid      [_In_ DWORD]                       -- The process id to be dumped.
+* @dumpPath [_In_ const std::filesystem::path&] -- The destination dump path.
+*
+* Returns:
+* @bool                                         -- Whether the operation was successful or not.
+*/
+bool ProcessHandler::Dump(_In_ DWORD pid, _In_ const std::filesystem::path& dumpPath) {
+	DWORD returned = 0;
+	IoctlProcessDump request{};
+	request.Pid = pid;
+	WCHAR fullPath[MAX_PATH_COPY]{};
+	DWORD fullPathLength = GetFullPathNameW(
+		dumpPath.c_str(),
+		static_cast<DWORD>(RTL_NUMBER_OF(fullPath)),
+		fullPath,
+		nullptr
+	);
+
+	if (fullPathLength == 0 || fullPathLength >= RTL_NUMBER_OF(fullPath)) {
+		DWORD error = GetLastError();
+		if (error == ERROR_SUCCESS)
+			error = ERROR_FILENAME_EXCED_RANGE;
+		std::cerr << "[dump] Failed to resolve output path: " << error << std::endl;
+		SetLastError(error);
+		return false;
+	}
+
+	std::wstring ntPath;
+
+	if (fullPath[0] == L'\\' && fullPath[1] == L'\\') {
+		ntPath = L"\\??\\UNC\\";
+		ntPath.append(fullPath + 2);
+	}
+	else {
+		ntPath = L"\\??\\";
+		ntPath.append(fullPath);
+	}
+
+	if (ntPath.length() >= RTL_NUMBER_OF(request.DumpPath) ||
+		wcscpy_s(request.DumpPath, ntPath.c_str()) != 0) {
+		SetLastError(ERROR_FILENAME_EXCED_RANGE);
+		return false;
+	}
+
+	if (!DeviceIoControl(*hNidhogg.get(), IOCTL_DUMP_PROCESS, &request, sizeof(request),
+		nullptr, 0, &returned, nullptr)) {
+		DWORD error = GetLastError();
+		std::cerr << "[dump] Kernel dump failed for PID " << pid << ": " << error
+			<< " (IOCTL 0x" << std::hex << IOCTL_DUMP_PROCESS << std::dec << ")" << std::endl;
+		SetLastError(error);
+		return false;
+	}
+
+	if (returned != 0) {
+		SetLastError(ERROR_BAD_LENGTH);
+		return false;
+	}
+
+	return true;
 }
 
 /*

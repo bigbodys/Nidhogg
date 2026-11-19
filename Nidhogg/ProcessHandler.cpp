@@ -1,6 +1,72 @@
 #include "pch.h"
 #include "ProcessHandler.h"
 
+namespace {
+	constexpr ULONG MINIDUMP_SIGNATURE = 0x504D444D;
+	constexpr ULONG MINIDUMP_VERSION = 0x0000A793;
+	constexpr ULONG MINIDUMP_SYSTEM_INFO_STREAM = 7;
+	constexpr ULONG MINIDUMP_MEMORY64_LIST_STREAM = 9;
+	constexpr ULONGLONG MINIDUMP_WITH_FULL_MEMORY = 0x00000002;
+	constexpr USHORT PROCESSOR_ARCHITECTURE_AMD64_VALUE = 9;
+	constexpr ULONG VER_PLATFORM_WIN32_NT_VALUE = 2;
+	constexpr SIZE_T DUMP_COPY_CHUNK_SIZE = 1024 * 1024;
+	constexpr LONGLONG WINDOWS_TO_UNIX_EPOCH = 116444736000000000LL;
+
+	struct KernelMinidumpHeader {
+		ULONG Signature;
+		ULONG Version;
+		ULONG NumberOfStreams;
+		ULONG StreamDirectoryRva;
+		ULONG CheckSum;
+		ULONG TimeDateStamp;
+		ULONGLONG Flags;
+	};
+
+	struct KernelMinidumpLocationDescriptor {
+		ULONG DataSize;
+		ULONG Rva;
+	};
+
+	struct KernelMinidumpDirectory {
+		ULONG StreamType;
+		KernelMinidumpLocationDescriptor Location;
+	};
+
+	struct KernelMinidumpSystemInfo {
+		USHORT ProcessorArchitecture;
+		USHORT ProcessorLevel;
+		USHORT ProcessorRevision;
+		UCHAR NumberOfProcessors;
+		UCHAR ProductType;
+		ULONG MajorVersion;
+		ULONG MinorVersion;
+		ULONG BuildNumber;
+		ULONG PlatformId;
+		ULONG CsdVersionRva;
+		ULONGLONG ProcessorFeatures[2];
+		ULONGLONG Reserved;
+	};
+
+	struct KernelMinidumpMemoryDescriptor64 {
+		ULONGLONG StartOfMemoryRange;
+		ULONGLONG DataSize;
+	};
+
+	using ZwQueryVirtualMemoryFn = NTSTATUS(NTAPI*)(
+		HANDLE,
+		PVOID,
+		ULONG,
+		PVOID,
+		SIZE_T,
+		PSIZE_T
+	);
+
+	static_assert(sizeof(KernelMinidumpHeader) == 32);
+	static_assert(sizeof(KernelMinidumpDirectory) == 12);
+	static_assert(sizeof(KernelMinidumpSystemInfo) == 56);
+	static_assert(sizeof(KernelMinidumpMemoryDescriptor64) == 16);
+}
+
 _IRQL_requires_max_(APC_LEVEL)
 ProcessHandler::ProcessHandler() {
 	if (!InitializeList(&protectedProcesses))
@@ -224,6 +290,353 @@ NTSTATUS ProcessHandler::ElevateProcess(_In_ ULONG pid) {
 
 	ObDereferenceObject(privilegedProcess);
 	ObDereferenceObject(targetProcess);
+	return status;
+}
+
+/*
+* Description:
+* SuspendProcess is responsible for suspending a process by its PID.
+*
+* Parameters:
+* @pid	  [_In_ ULONG] -- PID to suspend.
+*
+* Returns:
+* @status [NTSTATUS]  -- Whether the process was suspended successfully.
+*/
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS ProcessHandler::SuspendProcess(_In_ ULONG pid) {
+	using PsSuspendProcessFn = NTSTATUS(NTAPI*)(PEPROCESS);
+
+	if (!IsValidPid(pid) || ULongToHandle(pid) == PsGetCurrentProcessId())
+		return STATUS_INVALID_PARAMETER;
+
+	UNICODE_STRING routineName = RTL_CONSTANT_STRING(L"PsSuspendProcess");
+	auto psSuspendProcess = reinterpret_cast<PsSuspendProcessFn>(MmGetSystemRoutineAddress(&routineName));
+
+	if (!psSuspendProcess)
+		return STATUS_NOT_SUPPORTED;
+
+	PEPROCESS process = nullptr;
+	NTSTATUS status = PsLookupProcessByProcessId(ULongToHandle(pid), &process);
+
+	if (!NT_SUCCESS(status))
+		return status;
+
+	status = psSuspendProcess(process);
+	ObDereferenceObject(process);
+	return status;
+}
+
+/*
+* Description:
+* DumpProcess reads committed user-mode memory from a process and writes a minimal standard minidump.
+*
+* Parameters:
+* @dumpRequest [_In_ const IoctlProcessDump&] -- PID and NT output path.
+*
+* Returns:
+* @status [NTSTATUS] -- Whether the dump was written successfully.
+*/
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS ProcessHandler::DumpProcess(_In_ const IoctlProcessDump& dumpRequest) {
+	if (!IsValidPid(dumpRequest.Pid) ||
+		wcsnlen(dumpRequest.DumpPath, MAX_PATH_COPY) == MAX_PATH_COPY ||
+		_wcsnicmp(dumpRequest.DumpPath, L"\\??\\", 4) != 0) {
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	UNICODE_STRING queryRoutineName = RTL_CONSTANT_STRING(L"ZwQueryVirtualMemory");
+	auto queryVirtualMemory = reinterpret_cast<ZwQueryVirtualMemoryFn>(
+		MmGetSystemRoutineAddress(&queryRoutineName));
+
+	if (!queryVirtualMemory)
+		return STATUS_NOT_SUPPORTED;
+
+	PEPROCESS process = nullptr;
+	HANDLE processHandle = nullptr;
+	HANDLE fileHandle = nullptr;
+	NTSTATUS status = PsLookupProcessByProcessId(ULongToHandle(dumpRequest.Pid), &process);
+
+	if (!NT_SUCCESS(status))
+		return status;
+
+	UNICODE_STRING dumpPath{};
+	RtlInitUnicodeString(&dumpPath, dumpRequest.DumpPath);
+	OBJECT_ATTRIBUTES fileAttributes{};
+	InitializeObjectAttributes(&fileAttributes, &dumpPath,
+		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+	IO_STATUS_BLOCK ioStatus{};
+	bool fileCreated = false;
+
+	do {
+		status = ObOpenObjectByPointer(
+			process,
+			OBJ_KERNEL_HANDLE,
+			nullptr,
+			PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+			*PsProcessType,
+			KernelMode,
+			&processHandle
+		);
+
+		if (!NT_SUCCESS(status))
+			break;
+
+		status = ZwCreateFile(
+			&fileHandle,
+			GENERIC_WRITE | SYNCHRONIZE,
+			&fileAttributes,
+			&ioStatus,
+			nullptr,
+			FILE_ATTRIBUTE_NORMAL,
+			0,
+			FILE_OVERWRITE_IF,
+			FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+			nullptr,
+			0
+		);
+
+		if (!NT_SUCCESS(status))
+			break;
+		fileCreated = true;
+
+		auto IsDumpableRegion = [](const MEMORY_BASIC_INFORMATION& memoryInfo) -> bool {
+			return memoryInfo.State == MEM_COMMIT &&
+				memoryInfo.RegionSize != 0 &&
+				(memoryInfo.Protect & PAGE_NOACCESS) == 0 &&
+				(memoryInfo.Protect & PAGE_GUARD) == 0;
+		};
+
+		SIZE_T descriptorCapacity = 0;
+		ULONG_PTR queryAddress = 0;
+		const ULONG_PTR highestUserAddress = reinterpret_cast<ULONG_PTR>(MmHighestUserAddress);
+
+		while (queryAddress <= highestUserAddress) {
+			MEMORY_BASIC_INFORMATION memoryInfo{};
+			SIZE_T returnedLength = 0;
+			status = queryVirtualMemory(processHandle, reinterpret_cast<PVOID>(queryAddress), 0,
+				&memoryInfo, sizeof(memoryInfo), &returnedLength);
+
+			if (!NT_SUCCESS(status))
+				break;
+
+			if (IsDumpableRegion(memoryInfo))
+				descriptorCapacity++;
+
+			ULONG_PTR regionBase = reinterpret_cast<ULONG_PTR>(memoryInfo.BaseAddress);
+			ULONG_PTR nextAddress = regionBase + memoryInfo.RegionSize;
+
+			if (nextAddress <= queryAddress || nextAddress > highestUserAddress)
+				break;
+			queryAddress = nextAddress;
+		}
+
+		if (descriptorCapacity == 0) {
+			status = STATUS_NOT_FOUND;
+			break;
+		}
+
+		if (descriptorCapacity > MAXULONG_PTR / sizeof(KernelMinidumpMemoryDescriptor64)) {
+			status = STATUS_INTEGER_OVERFLOW;
+			break;
+		}
+
+		MemoryAllocator<KernelMinidumpMemoryDescriptor64*> descriptors(
+			descriptorCapacity * sizeof(KernelMinidumpMemoryDescriptor64));
+
+		if (!descriptors.IsValid()) {
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
+		}
+
+		SIZE_T descriptorCount = 0;
+		queryAddress = 0;
+
+		while (queryAddress <= highestUserAddress && descriptorCount < descriptorCapacity) {
+			MEMORY_BASIC_INFORMATION memoryInfo{};
+			SIZE_T returnedLength = 0;
+			status = queryVirtualMemory(processHandle, reinterpret_cast<PVOID>(queryAddress), 0,
+				&memoryInfo, sizeof(memoryInfo), &returnedLength);
+
+			if (!NT_SUCCESS(status))
+				break;
+
+			if (IsDumpableRegion(memoryInfo)) {
+				descriptors.Get()[descriptorCount].StartOfMemoryRange =
+					reinterpret_cast<ULONGLONG>(memoryInfo.BaseAddress);
+				descriptors.Get()[descriptorCount].DataSize =
+					static_cast<ULONGLONG>(memoryInfo.RegionSize);
+				descriptorCount++;
+			}
+
+			ULONG_PTR regionBase = reinterpret_cast<ULONG_PTR>(memoryInfo.BaseAddress);
+			ULONG_PTR nextAddress = regionBase + memoryInfo.RegionSize;
+
+			if (nextAddress <= queryAddress || nextAddress > highestUserAddress)
+				break;
+			queryAddress = nextAddress;
+		}
+
+		if (descriptorCount == 0) {
+			status = STATUS_NOT_FOUND;
+			break;
+		}
+
+		const ULONG streamCount = 2;
+		const ULONG directoryRva = sizeof(KernelMinidumpHeader);
+		const ULONG systemInfoRva = directoryRva + streamCount * sizeof(KernelMinidumpDirectory);
+		const ULONG memoryListRva = systemInfoRva + sizeof(KernelMinidumpSystemInfo);
+		const ULONGLONG memoryDataRva = static_cast<ULONGLONG>(memoryListRva) +
+			sizeof(ULONGLONG) * 2 +
+			static_cast<ULONGLONG>(descriptorCount) * sizeof(KernelMinidumpMemoryDescriptor64);
+
+		if (memoryDataRva > MAXULONG) {
+			status = STATUS_FILE_TOO_LARGE;
+			break;
+		}
+
+		LARGE_INTEGER systemTime{};
+		KeQuerySystemTime(&systemTime);
+		ULONG timestamp = 0;
+
+		if (systemTime.QuadPart > WINDOWS_TO_UNIX_EPOCH) {
+			timestamp = static_cast<ULONG>(
+				(systemTime.QuadPart - WINDOWS_TO_UNIX_EPOCH) / 10000000LL);
+		}
+
+		KernelMinidumpHeader header{
+			MINIDUMP_SIGNATURE,
+			MINIDUMP_VERSION,
+			streamCount,
+			directoryRva,
+			0,
+			timestamp,
+			MINIDUMP_WITH_FULL_MEMORY
+		};
+		KernelMinidumpDirectory directories[streamCount]{};
+		directories[0].StreamType = MINIDUMP_SYSTEM_INFO_STREAM;
+		directories[0].Location.DataSize = sizeof(KernelMinidumpSystemInfo);
+		directories[0].Location.Rva = systemInfoRva;
+		directories[1].StreamType = MINIDUMP_MEMORY64_LIST_STREAM;
+		directories[1].Location.DataSize = static_cast<ULONG>(
+			sizeof(ULONGLONG) * 2 +
+			descriptorCount * sizeof(KernelMinidumpMemoryDescriptor64));
+		directories[1].Location.Rva = memoryListRva;
+
+		RTL_OSVERSIONINFOW versionInfo{ sizeof(versionInfo) };
+		status = RtlGetVersion(&versionInfo);
+
+		if (!NT_SUCCESS(status))
+			break;
+
+		ULONG processorCount = KeQueryActiveProcessorCount(nullptr);
+		KernelMinidumpSystemInfo systemInfo{};
+		systemInfo.ProcessorArchitecture = PROCESSOR_ARCHITECTURE_AMD64_VALUE;
+		systemInfo.NumberOfProcessors = static_cast<UCHAR>(processorCount > MAXUCHAR ? MAXUCHAR : processorCount);
+		systemInfo.ProductType = 1;
+		systemInfo.MajorVersion = versionInfo.dwMajorVersion;
+		systemInfo.MinorVersion = versionInfo.dwMinorVersion;
+		systemInfo.BuildNumber = versionInfo.dwBuildNumber;
+		systemInfo.PlatformId = VER_PLATFORM_WIN32_NT_VALUE;
+
+		LARGE_INTEGER fileOffset{};
+		auto WriteData = [&](PVOID data, ULONG size) -> NTSTATUS {
+			IO_STATUS_BLOCK writeStatus{};
+			NTSTATUS writeResult = ZwWriteFile(fileHandle, nullptr, nullptr, nullptr, &writeStatus,
+				data, size, &fileOffset, nullptr);
+
+			if (!NT_SUCCESS(writeResult))
+				return writeResult;
+			if (writeStatus.Information != size)
+				return STATUS_DISK_FULL;
+			fileOffset.QuadPart += size;
+			return STATUS_SUCCESS;
+		};
+
+		status = WriteData(&header, sizeof(header));
+
+		if (!NT_SUCCESS(status))
+			break;
+		status = WriteData(directories, sizeof(directories));
+
+		if (!NT_SUCCESS(status))
+			break;
+		status = WriteData(&systemInfo, sizeof(systemInfo));
+
+		if (!NT_SUCCESS(status))
+			break;
+
+		ULONGLONG descriptorCount64 = descriptorCount;
+		status = WriteData(&descriptorCount64, sizeof(descriptorCount64));
+
+		if (!NT_SUCCESS(status))
+			break;
+
+		ULONGLONG memoryDataRvaValue = memoryDataRva;
+		status = WriteData(&memoryDataRvaValue, sizeof(memoryDataRvaValue));
+
+		if (!NT_SUCCESS(status))
+			break;
+
+		for (SIZE_T i = 0; i < descriptorCount; i++) {
+			status = WriteData(&descriptors.Get()[i], sizeof(KernelMinidumpMemoryDescriptor64));
+
+			if (!NT_SUCCESS(status))
+				break;
+		}
+
+		if (!NT_SUCCESS(status))
+			break;
+
+		MemoryAllocator<PUCHAR> copyBuffer(DUMP_COPY_CHUNK_SIZE);
+
+		if (!copyBuffer.IsValid()) {
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
+		}
+
+		for (SIZE_T i = 0; i < descriptorCount && NT_SUCCESS(status); i++) {
+			ULONGLONG regionOffset = 0;
+
+			while (regionOffset < descriptors.Get()[i].DataSize) {
+				SIZE_T remaining = static_cast<SIZE_T>(descriptors.Get()[i].DataSize - regionOffset);
+				SIZE_T chunkSize = remaining < DUMP_COPY_CHUNK_SIZE ? remaining : DUMP_COPY_CHUNK_SIZE;
+				SIZE_T bytesCopied = 0;
+				RtlSecureZeroMemory(copyBuffer.Get(), chunkSize);
+
+				NTSTATUS copyStatus = MmCopyVirtualMemory(
+					process,
+					reinterpret_cast<PVOID>(
+						descriptors.Get()[i].StartOfMemoryRange + regionOffset),
+					PsGetCurrentProcess(),
+					copyBuffer.Get(),
+					chunkSize,
+					KernelMode,
+					&bytesCopied
+				);
+
+				if (!NT_SUCCESS(copyStatus) && copyStatus != STATUS_PARTIAL_COPY)
+					bytesCopied = 0;
+
+				UNREFERENCED_PARAMETER(bytesCopied);
+				status = WriteData(copyBuffer.Get(), static_cast<ULONG>(chunkSize));
+
+				if (!NT_SUCCESS(status))
+					break;
+				regionOffset += chunkSize;
+			}
+		}
+	} while (false);
+
+	if (fileHandle)
+		ZwClose(fileHandle);
+	if (processHandle)
+		ZwClose(processHandle);
+	ObDereferenceObject(process);
+
+	if (!NT_SUCCESS(status) && fileCreated)
+		ZwDeleteFile(&fileAttributes);
+
 	return status;
 }
 

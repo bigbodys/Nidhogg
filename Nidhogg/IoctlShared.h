@@ -49,6 +49,12 @@ constexpr unsigned long IOCTL_CLEAR_HIDDEN_PORTS = static_cast<unsigned long>(CT
 constexpr unsigned long IOCTL_LIST_HIDDEN_PORTS = static_cast<unsigned long>(CTL_CODE_COPY(0x8000, 0x81E, METHOD_BUFFERED_COPY, FILE_ANY_ACCESS_COPY));
 
 constexpr unsigned long IOCTL_EXEC_NOF = static_cast<unsigned long>(CTL_CODE_COPY(0x8000, 0x81F, METHOD_BUFFERED_COPY, FILE_ANY_ACCESS_COPY));
+
+constexpr unsigned long IOCTL_GET_PROCESS_CR3 = static_cast<unsigned long>(CTL_CODE_COPY(0x8000, 0x820, METHOD_BUFFERED_COPY, FILE_ANY_ACCESS_COPY));
+constexpr unsigned long IOCTL_READ_QWORD_BY_CR3 = static_cast<unsigned long>(CTL_CODE_COPY(0x8000, 0x821, METHOD_BUFFERED_COPY, FILE_ANY_ACCESS_COPY));
+constexpr unsigned long IOCTL_READ_MEMORY_BY_CR3 = static_cast<unsigned long>(CTL_CODE_COPY(0x8000, 0x822, METHOD_BUFFERED_COPY, FILE_ANY_ACCESS_COPY));
+constexpr unsigned long IOCTL_SUSPEND_PROCESS = static_cast<unsigned long>(CTL_CODE_COPY(0x8000, 0x823, METHOD_BUFFERED_COPY, FILE_ANY_ACCESS_COPY));
+constexpr unsigned long IOCTL_DUMP_PROCESS = static_cast<unsigned long>(CTL_CODE_COPY(0x8000, 0x824, METHOD_BUFFERED_COPY, FILE_ANY_ACCESS_COPY));
 // *******************************************************************************************************
 
 // IOCTL related definitions
@@ -278,4 +284,29 @@ struct IoctlCoff {
 	SIZE_T DataSize;
 	PVOID Parameter;
 	SIZE_T ParameterSize;
+};
+
+constexpr SIZE_T MAX_CR3_READ_SIZE = 0x1000000;
+
+struct IoctlProcessCr3 {
+	unsigned long Pid;
+	unsigned long long Cr3;
+};
+
+struct IoctlProcessDump {
+	unsigned long Pid;
+	wchar_t DumpPath[MAX_PATH_COPY];
+};
+
+struct IoctlCr3ReadQword {
+	unsigned long long Cr3;
+	unsigned long long Address;
+	unsigned long long Value;
+};
+
+struct IoctlCr3ReadMemory {
+	unsigned long long Cr3;
+	unsigned long long Address;
+	SIZE_T Size;
+	PVOID Buffer;
 };
